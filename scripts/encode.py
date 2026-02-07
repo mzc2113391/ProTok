@@ -98,14 +98,12 @@ def main():
 
 
     if world_size > 1:
-        # 收集所有进程的结果
         all_results_list = [None for _ in range(world_size)]
         torch.distributed.all_gather_object(all_results_list, local_results)
         
         if is_main_process:
-            # 合并结果，注意：DistributedSampler 可能会为了补齐 batch 对数据进行 padding
             results = np.concatenate(all_results_list, axis=0)
-            results = results[:len(seqs)]  # 裁剪掉多余的 padding 部分
+            results = results[:len(seqs)]  
     else:
         results = local_results
 
