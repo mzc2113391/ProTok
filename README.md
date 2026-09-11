@@ -3,7 +3,9 @@
 This is the official code release for paper **“Compressed protein manifolds for evolutionary reasoning and protein engineering.”**
 
 <p align="center">
-  <img src="https://github.com/mzc2113391/ProTok/blob/main/figs/git_cover.png" width="100%">
+  <a href="figs/git_cover.pdf">
+    <img src="figs/git_cover.png" alt="ProTok model overview" width="100%">
+  </a>
 </p>
 
 ---
