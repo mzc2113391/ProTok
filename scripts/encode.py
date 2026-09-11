@@ -5,6 +5,8 @@ import argparse
 import lightning as L
 from net.ProTok import ProTok_lightning
 from src.common.utils import read_fasta, restype_order, build_feature
+from src.common.prediction import merge_indexed_arrays
+from pathlib import Path
 import pickle as pkl
 from torch.utils.data import DataLoader, TensorDataset
 from torch.distributed import init_process_group, destroy_process_group, get_rank, get_world_size
@@ -47,6 +49,8 @@ def main():
     if is_main_process:
         print(f"Reading FASTA: {args.input}")
     names, seqs = read_fasta(args.input)
+    if not seqs or len(names) != len(seqs):
+        raise ValueError('Input FASTA must contain one nonempty sequence per header.')
     
 
     features_dict = build_feature(
@@ -61,7 +65,7 @@ def main():
 
 
     keys = sorted(features_dict.keys())
-    dataset = TensorDataset(*(features_dict[k] for k in keys))
+    dataset = TensorDataset(torch.arange(len(seqs)), *(features_dict[k] for k in keys))
     
     sampler = torch.utils.data.distributed.DistributedSampler(
         dataset, num_replicas=world_size, rank=rank, shuffle=False
@@ -78,13 +82,15 @@ def main():
 
     dim = 768 if args.type == "latent" else 128
     local_results = []
+    local_indices = []
 
     if is_main_process:
         print(f"Extracting {args.type} features...")
 
     for batch_tensors in dataloader:
 
-        batch = {keys[i]: batch_tensors[i].to(device, non_blocking=True) for i in range(len(keys))}
+        local_indices.append(batch_tensors[0].numpy())
+        batch = {keys[i]: batch_tensors[i + 1].to(device, non_blocking=True) for i in range(len(keys))}
         
         latent, clip = model.encode(batch)
         out_tensor = latent if args.type == "latent" else clip
@@ -95,25 +101,27 @@ def main():
 
 
     local_results = np.concatenate(local_results, axis=0) if local_results else np.empty((0, dim))
+    local_part = {'index': np.concatenate(local_indices) if local_indices else np.empty(0, dtype=np.int64),
+                  'embedding': local_results}
 
 
     if world_size > 1:
         all_results_list = [None for _ in range(world_size)]
-        torch.distributed.all_gather_object(all_results_list, local_results)
+        torch.distributed.all_gather_object(all_results_list, local_part)
         
         if is_main_process:
-            results = np.concatenate(all_results_list, axis=0)
-            results = results[:len(seqs)]  
+            results = merge_indexed_arrays(all_results_list, len(seqs))['embedding']
     else:
-        results = local_results
+        results = merge_indexed_arrays([local_part], len(seqs))['embedding']
 
 
     if is_main_process:
-        os.makedirs(os.path.dirname(args.output), exist_ok=True)
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
         np.save(args.output, results)
         print(f"Succeeded! Total shapes: {results.shape}. Saved to: {args.output}")
 
         if args.save_uncond_train_pkl and args.type == "latent":
+            Path(args.save_uncond_train_pkl).parent.mkdir(parents=True, exist_ok=True)
             with open(args.save_uncond_train_pkl, "wb") as f:
                 pkl.dump({"embedding": results.reshape(-1, 64, 12), "labels": np.zeros(len(results))}, f)
                 print(f"Saved unconditional training dataset to: {args.save_uncond_train_pkl}")

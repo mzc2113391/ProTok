@@ -87,18 +87,29 @@ class ProTok(nn.Module):
         self,
         latent_act: torch.Tensor,
         method: str = "beam_search",
-        max_len: int = 1024,
+        max_len: Optional[int] = None,
         min_len: int = 64,
         num_beams: int = 5,
         num_return_sequences: int = 1,
         forbidden_token_ids: Optional[Union[Sequence[int], torch.Tensor]] = (20, 21, 22, 24),
-        num_prefix: int = 64,
+        num_prefix: Optional[int] = None,
         eos_warmup: int = 0,
         eos_bias: float = 0.0,
     ):
 
         device, dtype = latent_act.device, self.arr_dtype
-        B, num_prefix = latent_act.shape[0], 64
+        B = latent_act.shape[0]
+        num_prefix = self.num_prefix_tokens if num_prefix is None else num_prefix
+        if max_len is None:
+            max_len = 1024 - num_prefix - 1
+        if latent_act.ndim != 3 or latent_act.shape[1] != num_prefix or num_prefix != self.num_prefix_tokens:
+            raise ValueError("Latent prefix dimension must match the checkpoint.")
+        if method not in ("beam_search", "greedy_search", "sample", "top_p", "top_k"):
+            raise ValueError(f"Unknown decoding method: {method}")
+        if num_beams < 1 or num_return_sequences < 1:
+            raise ValueError("num_beams and num_return_sequences must be positive.")
+        if not 0 <= min_len <= max_len <= 1024 - num_prefix - 1 or max_len < 1:
+            raise ValueError("Require 0 <= min_len <= max_len <= 1024 - num_prefix - 1 and max_len > 0.")
         bos_id, eos_id = 22, 23
         
 
@@ -119,7 +130,7 @@ class ProTok(nn.Module):
         prefix_pos_emb = self.encoder.prefix_position_embedding_table(prefix_tokens).to(dtype)
         
         inputs = torch.full((batch_total, 1), bos_id, dtype=torch.long, device=device)
-        is_finished = torch.zeros(batch_total, dtype=torch.bool, device=device)
+        is_finished = torch.zeros(B if is_beam else batch_total, dtype=torch.bool, device=device)
 
         if forbidden_token_ids is None:
             forbidden_token_ids = (20, 21, 22, 24)
@@ -204,8 +215,8 @@ class ProTok(nn.Module):
                 
                 logits = (out[:, -1, :].to(torch.float32) @ output_table.T) / 0.9
                 logits[:, forbidden_tokens] = -float('inf')
-                self.block_no_repeat_ngram_(logits, inputs, 4)
-                self.apply_repetition_penalty_(logits, inputs, 1.15, bos_id)
+                DecoderUtils.block_no_repeat_ngram_(logits, inputs, 4)
+                DecoderUtils.apply_repetition_penalty_(logits, inputs, 1.15, bos_id)
                 DecoderUtils.apply_eos_bias(logits, inputs.shape[1]-1, min_len, 32, 3.0, eos_id)
                 
                 filtered = DecoderUtils.top_p_k_filter(logits, top_p=0.95)
@@ -274,7 +285,8 @@ class ProTok_lightning(L.LightningModule):
         self.model = model(config, global_config, self.protoken_codebook)
         self.config = config
         self.global_config = global_config
-        self.regressor = LatentRegressor(latent_dim=768, hidden_dim=64, output_dim=1)
+        self.regressor = LatentRegressor(latent_dim=config.encoder.num_prefix_tokens * config.vq_config.latent_dim,
+                                         hidden_dim=64, output_dim=1)
 
     def forward(self, x):
         
@@ -290,4 +302,4 @@ class ProTok_lightning(L.LightningModule):
         B, num_prefix, feature_dim = latent.shape
         y_hat = self.regressor(latent.reshape(B,-1))
 
-        return y_hat.detach().cpu().numpy().reshape(1)
+        return y_hat.detach().cpu().numpy().reshape(-1)

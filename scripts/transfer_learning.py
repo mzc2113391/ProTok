@@ -1,105 +1,77 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""Supervised ProTok transfer learning from user-supplied CSV files."""
+
 import argparse
+import json
+import math
+from pathlib import Path
+import pickle
 import time
-import numpy as np
-import torch
-import torch.nn.functional as F
-from torch import nn
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
+
 import lightning as L
 from lightning.pytorch import seed_everything
-from lightning.pytorch import loggers as pl_loggers
 from lightning.pytorch.callbacks import ModelCheckpoint, TQDMProgressBar
+from lightning.pytorch.loggers import TensorBoardLogger
+import numpy as np
 from scipy.stats import pearsonr, spearmanr
-from src.common.dataset import GFP_dataset
+import torch
+from torch import nn
+import torch.nn.functional as F
+
+from configs.config import compose_config
 from net.ProTok import ProTok
 from src.common.loss import reduce_loss
-from configs.config import compose_config
+from src.common.prediction import merge_indexed_arrays
 from src.common.lr_scheduler import get_cosine_scheduler_with_warmup
-from tqdm import tqdm
-import pickle as pkl
-from torchmetrics.regression import MeanSquaredError, PearsonCorrCoef, SpearmanCorrCoef
-torch._dynamo.config.optimize_ddp = False
-torch.multiprocessing.set_sharing_strategy("file_system")
-cfg = compose_config()
-ProTok_config = cfg.model
-global_config = cfg.global_cfg
+from src.common.transfer_data import ProteinDataModule
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="ProTok GFP Fine-tuning (argparse refactor, logic/output preserved)"
-    )
-
-    p.add_argument("--dataseed", type=int, default=42)
-
-    # Project / logging
-    p.add_argument("--project_name", type=str, default="GFP")
-    p.add_argument("--logger_name", type=str, default="GFP")
-    p.add_argument(
-        "--logger_save_dir",
-        type=str,
-        default="./results/transfer_runs/tensorbord_logger",
-    )
-    p.add_argument("--log_graph", action="store_true", default=True)
-
-    # Checkpoints
-    p.add_argument("--ckpt_path", type=str, default="./results/transfer_runs/GFP/")
-    p.add_argument(
-        "--init_ckpt",
-        type=str,
-        default="./checkpoint/ProTok_main.ckpt",
-        help="Checkpoint to load for fine-tuning",
-    )
-
-    # Data
-    p.add_argument(
-        "--train_csv_path",
-        type=str,
-        default="./data/Generation_data/DMS/GFP/GFP-train.csv",
-    )
-    p.add_argument(
-        "--test_csv_path",
-        type=str,
-        default="./data/Generation_data/DMS/GFP/GFP-test.csv",
-    )
-    p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--num_prefix", type=int, default=64)
-    p.add_argument("--max_len", type=int, default=1024)
-    p.add_argument("--num_workers", type=int, default=4)
-
-    # Training
-    p.add_argument("--num_epoch", type=int, default=50)
-    p.add_argument(
-        "--num_gpus",
-        type=int,
-        default=2,
-        help="Number of GPUs (used by Trainer and warmup_steps scaling)",
-    )
-    p.add_argument("--precision", type=str, default="16-mixed")
-    p.add_argument("--gradient_clip_val", type=float, default=1.0)
-    p.add_argument("--check_val_every_n_epoch", type=int, default=1)
-    p.add_argument("--log_every_n_steps", type=int, default=1)
-    p.add_argument("--progress_refresh_rate", type=int, default=1)
-
-    # LR schedule / optimizer
-    p.add_argument("--max_lr", type=float, default=1.0e-4)
-    p.add_argument("--min_lr", type=float, default=1.0e-7)
-    p.add_argument("--init_lr", type=float, default=1.0e-7)
-    p.add_argument("--warmup_ratio", type=float, default=0.01)
-    p.add_argument("--weight_decay", type=float, default=1e-4)
-
-    # Misc (kept for completeness; does not change your current logic)
-    p.add_argument("--val_check_interval", type=int, default=2000)
-    p.add_argument("--every_n_train_steps", type=int, default=10000)
-    p.add_argument("--bucket_size", type=int, default=50000)
-    p.add_argument("--log_frequency", type=int, default=10)
-
-    # save embedding path for diffusion training
-    p.add_argument("--save_embedding_path", type=str, default="./example/cond_traindit_exp.pkl")
-
+def build_parser():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument('--train_csv_path', required=True)
+    p.add_argument('--val_csv_path', help='Optional independent validation CSV; otherwise split training CSV.')
+    p.add_argument('--test_csv_path', help='Optional held-out test CSV, evaluated after model selection.')
+    p.add_argument('--sequence_column', default='seq')
+    p.add_argument('--target_column', default='fitness')
+    p.add_argument('--label_column', default='label', help='Optional categorical column for exported embeddings; empty string disables it.')
+    p.add_argument('--num_bins', type=int, help='Create this many target quantile bins using training rows only; overrides label_column.')
+    p.add_argument('--val_fraction', type=float, default=0.15)
+    p.add_argument('--dataseed', type=int, default=42)
+    p.add_argument('--unknown_residues', choices=['error', 'map-to-x'], default='error')
+    p.add_argument('--long_sequences', choices=['error', 'truncate'], default='error')
+    p.add_argument('--strip_characters', default='', help='Explicitly remove these characters, e.g. J for legacy GFP padding.')
+    p.add_argument('--batch_size', type=int, default=32, help='Batch size per device.')
+    p.add_argument('--num_prefix', type=int, default=None, help='Defaults to checkpoint value; must match it.')
+    p.add_argument('--max_len', type=int, default=1024, help='Total token length including prefix and special tokens.')
+    p.add_argument('--num_workers', type=int, default=4)
+    p.add_argument('--init_ckpt', default='./checkpoint/ProTok_main.ckpt')
+    p.add_argument('--ckpt_path', default='./results/transfer_runs/checkpoints')
+    p.add_argument('--save_embedding_path', default='./results/transfer_runs/train_embeddings.pkl')
+    p.add_argument('--skip_export', action='store_true')
+    p.add_argument('--project_name', default='transfer')
+    p.add_argument('--logger_name', default=None)
+    p.add_argument('--logger_save_dir', default='./results/transfer_runs/tensorboard')
+    p.add_argument('--log_graph', action='store_true', help='Enable TensorBoard graph logging.')
+    p.add_argument('--num_epoch', type=int, default=50)
+    p.add_argument('--num_gpus', type=int, default=1, help='GPU count; 0 selects CPU.')
+    p.add_argument('--precision', default=None, help='Defaults to bf16-mixed on supported GPUs, otherwise 16-mixed; CPU uses 32-true.')
+    p.add_argument('--gradient_clip_val', type=float, default=1.0)
+    p.add_argument('--accumulate_grad_batches', type=int, default=1)
+    p.add_argument('--check_val_every_n_epoch', type=int, default=1)
+    p.add_argument('--log_every_n_steps', type=int, default=10)
+    p.add_argument('--progress_refresh_rate', type=int, default=10)
+    p.add_argument('--max_lr', type=float, default=1e-4)
+    p.add_argument('--min_lr', type=float, default=1e-7)
+    p.add_argument('--init_lr', type=float, default=1e-7)
+    p.add_argument('--warmup_ratio', type=float, default=0.01)
+    p.add_argument('--weight_decay', type=float, default=1e-4)
+    p.add_argument('--legacy_weight_decay', action='store_true', help='Reproduce the old inverted decay groups; not recommended for new runs.')
+    p.add_argument('--recon_loss_weight', type=float, default=1.0)
+    p.add_argument('--reg_loss_weight', type=float, default=2.0)
+    p.add_argument('--monitor', choices=['val_mse', 'val_pearson', 'val_spearman'], default='val_mse')
+    p.add_argument('--save_top_k', type=int, default=1, help='Keep the best K checkpoints plus last; -1 keeps all.')
+    p.add_argument('--max_steps', type=int, default=-1, help='Optional optimizer-step cap for short runs.')
+    p.add_argument('--validate_data_only', action='store_true', help='Check CSVs and show split/label metadata without loading weights.')
     return p
 
 
@@ -111,456 +83,247 @@ class LatentRegressor(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, z):
-        h = self.dropout(F.relu(self.fc1(z)))
-        return self.fc2(h)
+        return self.fc2(self.dropout(F.relu(self.fc1(z))))
+
+
+def optimizer_parameter_groups(module, weight_decay, legacy=False):
+    """Keep biases, normalization and embedding parameters out of weight decay.
+
+    embedding_dense follows the original ProTok embedding-projection convention.
+    named_parameters deduplicates shared parameters and frozen weights are excluded.
+    """
+    decay, no_decay = [], []
+    for name, param in module.named_parameters():
+        if not param.requires_grad:
+            continue
+        exempt = param.ndim < 2 or any(key in name for key in ('bias', 'norm', 'embedding_table', 'embedding_dense'))
+        (no_decay if exempt else decay).append(param)
+    return [
+        {'params': decay, 'weight_decay': 0.0 if legacy else weight_decay},
+        {'params': no_decay, 'weight_decay': weight_decay if legacy else 0.0},
+    ]
+
+
+def regression_metrics(records):
+    y, pred = records['target'], records['pred']
+    varying = len(y) >= 2 and np.ptp(y) > 0 and np.ptp(pred) > 0
+    return {
+        'mse': float(np.mean((pred.astype(np.float64) - y) ** 2)),
+        'pearson': float(pearsonr(pred, y).statistic) if varying else float('nan'),
+        'spearman': float(spearmanr(pred, y).statistic) if varying else float('nan'),
+        'recon_loss_epoch': float(records['recon_numerator'].sum() / records['recon_weight'].sum()),
+    }
 
 
 class ProTok_FT(L.LightningModule):
     def __init__(self, model, config, global_config, protoken_codebook=None, **kwargs):
         super().__init__()
-        self.save_hyperparameters(ignore=["protoken_codebook"])
-
-        if protoken_codebook is None:
-            placeholder = torch.zeros((22, 1280))
-            self.register_buffer("protoken_codebook", placeholder)
-        else:
-            self.register_buffer("protoken_codebook", protoken_codebook)
-
+        self.save_hyperparameters(ignore=['protoken_codebook'])
+        self.register_buffer('protoken_codebook', torch.zeros(22, 1280) if protoken_codebook is None else protoken_codebook)
         self.model = model(config, global_config, self.protoken_codebook)
-        self.config = config
-        self.global_config = global_config
-
-        self.regressor = LatentRegressor()
-        self.no_decay_modulename = ["bias", "norm", "embedding_table", "embedding_dense"]
-
-        for p in self.model.clip_projection_layer.parameters():
-            p.requires_grad = False
-
-        self.recon_loss_weight = 1
-        self.reg_loss_weight = 2
-
-        # ===== Metrics (DDP-safe) =====
-        # validation
-        self.val_pearson_metric = PearsonCorrCoef()
-        self.val_spearman_metric = SpearmanCorrCoef()
-        self.val_mse_metric = MeanSquaredError()
-
-        # test
-        self.test_pearson_metric = PearsonCorrCoef()
-        self.test_spearman_metric = SpearmanCorrCoef()
-        self.test_mse_metric = MeanSquaredError()
-
-        # mean recon loss (use torch tensor accumulation to be DDP-friendly)
-        self.register_buffer("val_recon_sum", torch.tensor(0.0))
-        self.register_buffer("val_recon_count", torch.tensor(0.0))
-        self.register_buffer("test_recon_sum", torch.tensor(0.0))
-        self.register_buffer("test_recon_count", torch.tensor(0.0))
+        self.config, self.global_config = config, global_config
+        latent_dim = config.encoder.num_prefix_tokens * config.vq_config.latent_dim
+        self.regressor = LatentRegressor(latent_dim=latent_dim)
+        self.model.clip_projection_layer.requires_grad_(False)
+        self._eval_records = []
 
     def forward(self, x):
         return self.model(x)
 
     def training_step(self, batch, batch_idx):
-        outputs = self.model(batch["input"])
-
-        latent = outputs["quantized"]
-        B, num_prefix, feature_dim = latent.shape
-
-        targets = batch["fitness"]
-        y_hat = self.regressor(latent.reshape(B, -1))
-
-        y_hat_gathered = self.all_gather(y_hat, sync_grads=True)
-        targets_gathered = self.all_gather(targets, sync_grads=True)
-
-        if self.trainer.world_size > 1:
-            global_batch_size = y_hat_gathered.size(0) * y_hat_gathered.size(1)
-            y_hat_global = y_hat_gathered.view(global_batch_size, -1)
-            targets_global = targets_gathered.view(global_batch_size, -1)
-        else:
-            if isinstance(y_hat_gathered, list) and len(y_hat_gathered) == 1:
-                y_hat_global = y_hat_gathered[0]
-                targets_global = targets_gathered[0]
-            elif (
-                y_hat_gathered.dim() == y_hat_gathered.dim() + 1
-                and y_hat_gathered.size(0) == 1
-            ):
-                y_hat_global = y_hat_gathered.squeeze(0)
-                targets_global = targets_gathered.squeeze(0)
-            else:
-                y_hat_global = y_hat_gathered
-                targets_global = targets_gathered
-
-        logits = outputs["decode_protokens_logits"]
-        reduced_reconstruct_loss = reduce_loss(
-            logits, batch["input"]["label_mask"], batch["input"]["label"]
-        )
-## You can also try smoothl1 loss, may be more robust!
-        reg_loss = nn.MSELoss()(y_hat_global.flatten(), targets_global.flatten())
-        loss = self.recon_loss_weight * reduced_reconstruct_loss + self.reg_loss_weight * reg_loss
-
-        current_lr = self.trainer.optimizers[0].param_groups[0]["lr"]
-
-        log_frequency = self.hparams.get("log_frequency", 10)
-        if batch_idx % log_frequency == 0:
-            self.log("reconstruct_loss", reduced_reconstruct_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True)
-            self.log("Total_loss", loss, on_step=True, prog_bar=True, logger=True, sync_dist=True)
-            self.log("reg_loss", reg_loss, on_step=True, prog_bar=True, logger=True, sync_dist=True)
-            self.log("lr", current_lr, on_step=True, prog_bar=True, logger=True, sync_dist=True)
-
-        self.log("train_loss_epoch", loss, on_epoch=True, on_step=False, prog_bar=True, logger=True, sync_dist=True)
+        outputs = self.model(batch['input'])
+        pred = self.regressor(outputs['quantized'].flatten(1)).flatten()
+        # DDP averages local gradients. A differentiable all_gather is unnecessary for MSE.
+        reg_loss = F.mse_loss(pred.float(), batch['fitness'].float().flatten())
+        recon_loss = reduce_loss(outputs['decode_protokens_logits'], batch['input']['label_mask'], batch['input']['label'])
+        loss = self.hparams.get('recon_loss_weight', 1.0) * recon_loss + self.hparams.get('reg_loss_weight', 2.0) * reg_loss
+        for key, value in {'train_recon_loss': recon_loss, 'train_reg_loss': reg_loss, 'train_loss': loss}.items():
+            self.log(key, value, on_step=True, on_epoch=True, sync_dist=True, batch_size=len(pred), prog_bar=key == 'train_loss')
+        self.log('lr', self.trainer.optimizers[0].param_groups[0]['lr'], on_step=True, on_epoch=False)
         return loss
 
-    # ------------------------
-    # Validation (DDP-correct)
-    # ------------------------
     def on_validation_epoch_start(self):
-        # reset accumulators + metrics
-        self.val_recon_sum.zero_()
-        self.val_recon_count.zero_()
-        self.val_pearson_metric.reset()
-        self.val_spearman_metric.reset()
-        self.val_mse_metric.reset()
+        self._eval_records = []
 
-    def validation_step(self, val_batch, batch_idx):
-        outputs = self.model(val_batch["input"])
+    def on_test_epoch_start(self):
+        self._eval_records = []
 
-        latent = outputs["quantized"]
-        B, num_prefix, feature_dim = latent.shape
+    def _evaluation_step(self, batch):
+        outputs = self.model(batch['input'])
+        pred = self.regressor(outputs['quantized'].flatten(1)).flatten().float()
+        logits = outputs['decode_protokens_logits'].float()
+        labels, mask = batch['input']['label'], batch['input']['label_mask']
+        token_loss = F.cross_entropy(logits.flatten(0, 1), labels.flatten(), reduction='none', label_smoothing=0.05).reshape_as(mask)
+        lengths = mask.sum(1).float()
+        weights = lengths.sqrt()
+        records = {
+            'index': batch['index'], 'pred': pred, 'target': batch['fitness'].float().flatten(),
+            'recon_numerator': (token_loss * mask).sum(1) / lengths * weights,
+            'recon_weight': weights,
+        }
+        self._eval_records.append({key: value.detach().cpu().numpy() for key, value in records.items()})
 
-        targets = val_batch["fitness"].unsqueeze(-1).float()
-        y_hat = self.regressor(latent.reshape(B, -1))
+    def validation_step(self, batch, batch_idx):
+        self._evaluation_step(batch)
 
-        logits = outputs["decode_protokens_logits"]
-        recon_loss = reduce_loss(
-            logits, val_batch["input"]["label_mask"], val_batch["input"]["label"]
-        )
+    def test_step(self, batch, batch_idx):
+        self._evaluation_step(batch)
 
-        reg_loss = nn.MSELoss()(y_hat.flatten(), targets.flatten())
-
-        # step logging (keep your keys)
-        self.log("val_loss", recon_loss, sync_dist=True, on_epoch=True, on_step=True, prog_bar=True, logger=True)
-        self.log("reg_loss", reg_loss, sync_dist=True, on_epoch=True, on_step=True, prog_bar=True, logger=True)
-
-        # update recon mean (tensor accum, safe)
-        self.val_recon_sum += recon_loss.detach()
-        self.val_recon_count += 1.0
-
-        # update global metrics (torchmetrics handles DDP)
-        y = targets.flatten()
-        ypred = y_hat.flatten()
-
-        # torchmetrics expects float tensor
-        self.val_mse_metric.update(ypred, y)
-        # Pearson/Spearman require at least 2 points; torchmetrics will handle but can output nan for tiny batches
-        self.val_pearson_metric.update(ypred, y)
-        self.val_spearman_metric.update(ypred, y)
-
-        return {"pred": y_hat, "label": targets}
+    def _evaluation_epoch_end(self, stage):
+        local = {key: np.concatenate([r[key] for r in self._eval_records]) for key in self._eval_records[0]}
+        parts = [local]
+        if torch.distributed.is_initialized():
+            parts = [None] * self.trainer.world_size
+            torch.distributed.all_gather_object(parts, local)
+        # Metrics are computed once per real row, even when DDP pads the last batch.
+        metrics = regression_metrics(merge_indexed_arrays(parts))
+        for name, value in metrics.items():
+            # Every rank has the same global scalar; averaging it again preserves its value.
+            self.log(f'{stage}_{name}', value, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        self._eval_records.clear()
 
     def on_validation_epoch_end(self):
-        # mean recon loss over steps
-        mean_recon = self.val_recon_sum / torch.clamp(self.val_recon_count, min=1.0)
-
-        val_mse = self.val_mse_metric.compute()
-        val_pearson = self.val_pearson_metric.compute()
-        val_spearman = self.val_spearman_metric.compute()
-
-        # IMPORTANT: sync_dist=True here is now correct because compute() returns a DDP-synced metric
-        self.log("val_recon_loss_epoch", mean_recon, prog_bar=True, logger=True, on_epoch=True, on_step=False, sync_dist=True)
-        self.log("val_pearson", val_pearson, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        self.log("val_spearman", val_spearman, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        self.log("val_mse", val_mse, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-
-        if self.trainer.is_global_zero:
-            try:
-                print("pearson", float(val_pearson))
-                print("spearman", float(val_spearman))
-            except Exception:
-                print("pearson", val_pearson)
-                print("spearman", val_spearman)
-
-    # -------------------
-    # Test (DDP-correct)
-    # -------------------
-    def on_test_epoch_start(self):
-        self.test_recon_sum.zero_()
-        self.test_recon_count.zero_()
-        self.test_pearson_metric.reset()
-        self.test_spearman_metric.reset()
-        self.test_mse_metric.reset()
-
-    def test_step(self, test_batch, batch_idx):
-        outputs = self.model(test_batch["input"])
-
-        latent = outputs["quantized"]
-        B, num_prefix, feature_dim = latent.shape
-
-        targets = test_batch["fitness"].unsqueeze(-1).float()
-        y_hat = self.regressor(latent.reshape(B, -1))
-
-        logits = outputs["decode_protokens_logits"]
-        recon_loss = reduce_loss(
-            logits, test_batch["input"]["label_mask"], test_batch["input"]["label"]
-        )
-
-        # recon mean
-        self.test_recon_sum += recon_loss.detach()
-        self.test_recon_count += 1.0
-
-        # metrics update
-        y = targets.flatten()
-        ypred = y_hat.flatten()
-        self.test_mse_metric.update(ypred, y)
-        self.test_pearson_metric.update(ypred, y)
-        self.test_spearman_metric.update(ypred, y)
-
-        return {"pred": y_hat, "label": targets}
+        self._evaluation_epoch_end('val')
 
     def on_test_epoch_end(self):
-        mean_recon = self.test_recon_sum / torch.clamp(self.test_recon_count, min=1.0)
+        self._evaluation_epoch_end('test')
 
-        test_mse = self.test_mse_metric.compute()
-        test_pearson = self.test_pearson_metric.compute()
-        test_spearman = self.test_spearman_metric.compute()
-
-        self.log("test_recon_loss_epoch", mean_recon, sync_dist=True)
-        self.log("test_pearson_final", test_pearson)
-        self.log("test_spearman_final", test_spearman)
-        self.log("test_mse_final", test_mse)
-        if self.trainer.is_global_zero:
-            print(
-                f"\nTest Results - Pearson: {float(test_pearson):.4f}, Spearman: {float(test_spearman):.4f}, MSE: {float(test_mse):.4f}"
-            )
-
-    # --------------
-    # Optimizers
-    # --------------
     def configure_optimizers(self):
-        optimizer_grouped_parameters = [
-            {
-                "params": [
-                    p for n, p in self.named_parameters()
-                    if not any(nd in n for nd in self.no_decay_modulename) and p.requires_grad
-                ],
-                "weight_decay": 0.0,
-            },
-            {
-                "params": [
-                    p for n, p in self.named_parameters()
-                    if any(nd in n for nd in self.no_decay_modulename) and p.requires_grad
-                ],
-                "weight_decay": self.hparams.weight_decay,
-            },
-        ]
-
-        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.hparams.max_lr)
-
-        train_batches = len(self.trainer.datamodule.train_dataloader())
-        total_steps = self.hparams.num_epochs * train_batches
-        warmup_steps = int(total_steps * self.hparams.warmup_ratio) // self.hparams.num_gpus
-
+        h = self.hparams
+        groups = optimizer_parameter_groups(self, h.weight_decay, h.get('legacy_weight_decay', False))
+        optimizer = torch.optim.AdamW(groups, lr=h.max_lr)
+        steps = self.trainer.estimated_stepping_batches
+        if not math.isfinite(steps) or steps < 1:
+            raise ValueError('Training must have a finite positive number of optimizer steps.')
+        total_steps = int(steps)
         scheduler = get_cosine_scheduler_with_warmup(
-            optimizer,
-            warmup_steps=warmup_steps,
-            total_steps=total_steps,
-            max_lr=self.hparams.max_lr,
-            min_lr=self.hparams.min_lr,
-            init_lr=self.hparams.init_lr,
+            optimizer, warmup_steps=int(total_steps * h.warmup_ratio), total_steps=total_steps,
+            max_lr=h.max_lr, min_lr=h.min_lr, init_lr=h.init_lr,
         )
+        return {'optimizer': optimizer, 'lr_scheduler': {'scheduler': scheduler, 'interval': 'step'}}
 
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
-        }
-
-    # -------
-    # Encode / Predict
-    # -------
     def encode(self, x):
         return self.model.encode(x)
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        latent, clip = self.model.encode(batch["input"])
-        return {
-            "index": batch["index"].detach().cpu(),
-            "embedding": latent.detach().cpu(),
+        latent, _ = self.encode(batch['input'])
+        return {'index': batch['index'].detach().cpu(), 'embedding': latent.float().detach().cpu()}
+
+
+def load_initial_model(path, **training_options):
+    """Load published checkpoints, rejecting missing backbone weights instead of hiding them."""
+    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+    hparams = checkpoint.get('hyper_parameters', {})
+    defaults = compose_config()
+    config = hparams.get('config', defaults.model)
+    global_config = hparams.get('global_config', defaults.global_cfg)
+    model = ProTok_FT(model=ProTok, config=config, global_config=global_config, **training_options)
+    state = checkpoint['state_dict']
+    # Older training checkpoints may contain metric accumulators; these are not model weights.
+    state = {key: value for key, value in state.items()
+             if key.startswith(('model.', 'regressor.')) or key == 'protoken_codebook'}
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    backbone_missing = [key for key in missing if not key.startswith('regressor.')]
+    if backbone_missing or unexpected:
+        raise ValueError(f'Incompatible checkpoint: missing={backbone_missing}, unexpected={unexpected}')
+    if missing:
+        print(f'Initialized new regression head: {missing}')
+    return model
+
+
+def export_embeddings(trainer, model, data_module, path):
+    predictions = trainer.predict(model, datamodule=data_module, ckpt_path='best')
+    local = {key: torch.cat([part[key] for part in predictions]).numpy() for key in predictions[0]} if predictions else {
+        'index': np.empty(0, dtype=np.int64),
+        'embedding': np.empty((0, data_module.hparams.num_prefix, model.config.vq_config.latent_dim), dtype=np.float32),
+    }
+    parts = [local]
+    if torch.distributed.is_initialized():
+        parts = [None] * trainer.world_size if trainer.is_global_zero else None
+        torch.distributed.gather_object(local, parts, dst=0)
+    if trainer.is_global_zero:
+        merged = merge_indexed_arrays(parts, len(data_module.predict_ds))
+        payload = {
+            'embedding': merged['embedding'],
+            'row_indices': data_module.predict_ds.row_indices,
+            'targets': data_module.predict_ds.data_targets.numpy(),
+            'metadata': data_module.split_manifest(),
         }
-
-
-
-class MyDataModule(L.LightningDataModule):
-    def __init__(
-        self,
-        train_csv_path,
-        test_csv_path,
-        batch_size,
-        num_prefix,
-        max_len,
-        num_workers=8,
-    ):
-        super().__init__()
-        self.train_csv_path = train_csv_path
-        self.test_csv_path = test_csv_path
-        self.num_workers = num_workers
-        self.num_prefix = num_prefix
-        self.max_len = max_len
-        self.batch_size = batch_size
-
-    def setup(self, stage=None):
-        if stage == "fit" or stage is None:
-            self.train_ds = GFP_dataset(self.train_csv_path, "train", num_prefix_tokens=self.num_prefix, max_len=self.max_len)
-            self.val_ds = GFP_dataset(self.train_csv_path, "val", num_prefix_tokens=self.num_prefix, max_len=self.max_len)
-        if stage == "test" or stage is None:
-            self.test_ds = GFP_dataset(self.test_csv_path, "test", num_prefix_tokens=self.num_prefix, max_len=self.max_len)
-        if stage == "predict":
-            base_ds = GFP_dataset(self.train_csv_path, "train", num_prefix_tokens=self.num_prefix, max_len=self.max_len)
-            self.predict_ds = IndexedDataset(base_ds)
-
-    def train_dataloader(self): return DataLoader(self.train_ds, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
-    def val_dataloader(self): return DataLoader(self.val_ds, batch_size=self.batch_size, num_workers=self.num_workers)
-    def test_dataloader(self): return DataLoader(self.test_ds, batch_size=self.batch_size, num_workers=self.num_workers)
-    def predict_dataloader(self): return DataLoader(self.predict_ds, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
-
-    
-class IndexedDataset(torch.utils.data.Dataset):
-    def __init__(self, base_ds):
-        self.base_ds = base_ds
-
-    def __len__(self):
-        return len(self.base_ds)
-
-    def __getitem__(self, idx):
-        item = self.base_ds[idx]
-        item["index"] = idx
-        return item
+        if data_module.export_labels is not None:
+            payload['labels'] = data_module.export_labels
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('wb') as handle:
+            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f'Saved {len(payload["embedding"])} training embeddings to {path}; label metadata: {data_module.label_metadata}')
 
 
 def main():
-    args = build_parser().parse_args()
-
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.num_gpus < 0 or args.num_epoch < 1 or args.accumulate_grad_batches < 1:
+        parser.error('num_gpus must be nonnegative; num_epoch and accumulate_grad_batches must be positive.')
+    if not 0 <= args.warmup_ratio < 1 or args.weight_decay < 0:
+        parser.error('warmup_ratio must be in [0, 1); weight_decay must be nonnegative.')
+    if args.save_top_k == 0 or args.save_top_k < -1:
+        parser.error('save_top_k must be -1 or positive, so a best checkpoint is available.')
+    if not 1 <= args.check_val_every_n_epoch <= args.num_epoch:
+        parser.error('check_val_every_n_epoch must be between 1 and num_epoch.')
+    if args.recon_loss_weight <= 0 or args.reg_loss_weight <= 0:
+        parser.error('Both loss weights must be positive for joint transfer learning.')
     seed_everything(args.dataseed, workers=True)
-
-    logger = pl_loggers.TensorBoardLogger(
-        name=args.logger_name,
-        save_dir=args.logger_save_dir,
-        log_graph=args.log_graph,
+    model = None
+    num_prefix = args.num_prefix or 64
+    if not args.validate_data_only:
+        model = load_initial_model(args.init_ckpt, **{
+            name: getattr(args, name) for name in ('max_lr', 'min_lr', 'init_lr', 'warmup_ratio', 'weight_decay',
+                                                  'legacy_weight_decay', 'recon_loss_weight', 'reg_loss_weight')})
+        num_prefix = model.config.encoder.num_prefix_tokens
+        if args.num_prefix is not None and args.num_prefix != num_prefix:
+            parser.error(f'num_prefix must match checkpoint ({num_prefix}).')
+    dm = ProteinDataModule(
+        train_csv_path=args.train_csv_path, val_csv_path=args.val_csv_path, test_csv_path=args.test_csv_path,
+        batch_size=args.batch_size, num_prefix=num_prefix, max_len=args.max_len, num_workers=args.num_workers,
+        sequence_column=args.sequence_column, target_column=args.target_column, label_column=args.label_column,
+        val_fraction=args.val_fraction, seed=args.dataseed, num_bins=args.num_bins,
+        unknown_residues=args.unknown_residues, long_sequences=args.long_sequences, strip_characters=args.strip_characters,
     )
-
-    data_module = MyDataModule(
-        train_csv_path=args.train_csv_path,
-        test_csv_path=args.test_csv_path,
-        batch_size=args.batch_size,
-        num_prefix=args.num_prefix,
-        max_len=args.max_len,
-        num_workers=args.num_workers
+    dm.setup()
+    print(f'Data: train={len(dm.train_ds)}, val={len(dm.val_ds)}, test={len(dm.test_ds) if dm.test_ds is not None else 0}; labels={dm.label_metadata}')
+    if args.validate_data_only:
+        return
+    logger = TensorBoardLogger(save_dir=args.logger_save_dir, name=args.logger_name or args.project_name, log_graph=args.log_graph)
+    checkpoint = ModelCheckpoint(monitor=args.monitor, mode='min' if args.monitor == 'val_mse' else 'max',
+                                 dirpath=args.ckpt_path, filename='ProTok-{epoch:03d}-{step:06d}',
+                                 save_top_k=args.save_top_k, save_last=True, save_on_train_epoch_end=False)
+    precision = args.precision or (
+        ('bf16-mixed' if torch.cuda.is_bf16_supported() else '16-mixed') if args.num_gpus else '32-true'
     )
-
-    lightning_model = ProTok_FT.load_from_checkpoint(
-        args.init_ckpt,
-        config = ProTok_config,
-        global_config =global_config,
-        max_lr=args.max_lr,
-        min_lr=args.min_lr,
-        warmup_ratio=args.warmup_ratio,
-        weight_decay=args.weight_decay,
-        num_epochs=args.num_epoch,
-        init_lr=args.init_lr,
-        num_gpus=args.num_gpus,  
-        strict=False,
-        log_frequency=args.log_frequency,
-    )
-
-    lightning_model.hparams.update(
-        {"model_class": ProTok, "config": ProTok_config, "global_config": global_config}
-    )
-
-    checkpoint_callback = ModelCheckpoint(
-        monitor="val_pearson",
-        mode="max",
-        dirpath=args.ckpt_path,
-        filename="StablePT-{epoch:03d}-{step:06d}-{val_pearson:.3f}-{val_recon_loss_epoch:.3f}-{val_spearman:.3f}",
-        save_top_k=-1,
-        save_last=True,
-    )
-
     trainer = L.Trainer(
-        logger=logger,
-        callbacks=[checkpoint_callback, TQDMProgressBar(refresh_rate=args.progress_refresh_rate)],
-        gradient_clip_val=args.gradient_clip_val,
-        max_epochs=args.num_epoch,
-        accelerator="cuda",
-        devices=str(args.num_gpus),
-        precision=args.precision,
-        check_val_every_n_epoch=args.check_val_every_n_epoch,
-        log_every_n_steps=args.log_every_n_steps,
+        logger=logger, callbacks=[checkpoint, TQDMProgressBar(refresh_rate=args.progress_refresh_rate)],
+        max_epochs=args.num_epoch, max_steps=args.max_steps, accelerator='gpu' if args.num_gpus else 'cpu',
+        devices=args.num_gpus or 1, precision=precision,
+        gradient_clip_val=args.gradient_clip_val, accumulate_grad_batches=args.accumulate_grad_batches,
+        check_val_every_n_epoch=args.check_val_every_n_epoch, log_every_n_steps=args.log_every_n_steps,
     )
-
-    start_time = time.time()
-    trainer.fit(model=lightning_model, datamodule=data_module)
-
-    print("traning time:", time.time() - start_time)
-
-    best_path = checkpoint_callback.best_model_path
-    best_score = checkpoint_callback.best_model_score
-
-    print(f"--- Training finished ---")
-    print(f"best model path: {best_path}")
-    print(f"best val_pearson score: {best_score:.4f}")
-
-    if torch.distributed.is_initialized():
-        torch.distributed.destroy_process_group()
-
-
     if trainer.is_global_zero:
-        print("\n" + "="*30)
-        print("Starting Single-GPU Evaluation & Encoding")
-        print("="*30)
+        output_dir = Path(logger.log_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / 'data_manifest.json').write_text(json.dumps(dm.split_manifest(), indent=2) + '\n')
+        run_config = dict(vars(args), resolved_precision=precision, resolved_num_prefix=num_prefix)
+        (output_dir / 'run_config.json').write_text(json.dumps(run_config, indent=2) + '\n')
+    start = time.time()
+    trainer.fit(model, datamodule=dm)
+    if not checkpoint.best_model_path:
+        raise RuntimeError('No validation checkpoint was saved. Run through a validation epoch before evaluation/export.')
+    if trainer.is_global_zero:
+        print(f'Training time: {time.time() - start:.1f}s; best checkpoint: {checkpoint.best_model_path}')
+    # Keep the same strategy and process group for every stage; all ranks participate.
+    if args.test_csv_path:
+        trainer.test(model, datamodule=dm, ckpt_path='best')
+    if not args.skip_export:
+        export_embeddings(trainer, model, dm, args.save_embedding_path)
 
 
-        eval_trainer = L.Trainer(accelerator="cuda", devices=1, logger=False, precision=args.precision)
-        best_model_path = checkpoint_callback.best_model_path
-
-
-        print(f"--- Testing on: {best_model_path} ---")
-        eval_trainer.test(lightning_model, datamodule=data_module, ckpt_path=best_model_path)
-        
-
-        print(f"Test Pearson: {lightning_model.test_pearson_metric.compute():.4f}")
-
-
-        print(f"--- Encoding training sequences to {args.save_embedding_path} ---")
-        data_module.setup("predict")
-        predictions = eval_trainer.predict(lightning_model, datamodule=data_module, ckpt_path=best_model_path)
-
-
-        all_indices = []
-        all_embeddings = []
-        for batch in predictions:
-            all_indices.append(batch["index"])
-            all_embeddings.append(batch["embedding"])
-
-        full_indices = torch.cat(all_indices).numpy()
-        full_embeddings = torch.cat(all_embeddings).numpy()
-
-
-        sort_idx = np.argsort(full_indices)
-        final_embeddings = full_embeddings[sort_idx]
-        
-
-        train_labels = data_module.predict_ds.base_ds.data_labels - 1
-
-        with open(args.save_embedding_path, "wb") as f:
-            pkl.dump({"embedding": final_embeddings, "labels": train_labels}, f)
-
-        print(f"Success! Saved {len(final_embeddings)} embeddings.")
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-
-
-
-
-
-
-
-
-

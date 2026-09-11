@@ -32,11 +32,11 @@ def run_inference(args):
     print("Generating phylogenetic tree...")
     bio_tree_nj = create_tree(seq_embedding_list, names)
 
-    os.makedirs(os.path.dirname(args.output_nwk), exist_ok=True)
+    os.makedirs(os.path.dirname(args.output_nwk) or '.', exist_ok=True)
     Phylo.write(bio_tree_nj, args.output_nwk, "newick")
     print(f"Newick tree saved to: {args.output_nwk}")
 
-    os.makedirs(os.path.dirname(args.output_png), exist_ok=True)
+    os.makedirs(os.path.dirname(args.output_png) or '.', exist_ok=True)
     fig = plt.figure(figsize=(15, 15))
     ax = fig.add_subplot(1, 1, 1)
     Phylo.draw(

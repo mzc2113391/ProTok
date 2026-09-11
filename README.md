@@ -12,7 +12,7 @@ This is the official code release for paper **“Compressed protein manifolds fo
 - [Overview](#overview)
 - [Installation](#installation)
 - [Pretrained checkpoints](#pretrained-checkpoints)
-- [Quick start](#quick-start)
+- [Transfer learning](#transfer-learning)
 - [Sequence encoding](#sequence-encoding)
 - [Large-scale sequence search (FAISS)](#large-scale-sequence-search-faiss)
 - [Tree inference & phylogenetic congruence](#tree-inference--phylogenetic-congruence)
@@ -41,12 +41,12 @@ This repository is configured via `environment.yml`:
 
 ```bash
 conda env create -f environment.yml
-conda activate protok
+conda activate ProTok
 ```
 
 ### Core dependencies (reference)
 
-Exact versions may vary across platforms; see `environment.yaml` for the authoritative specification.
+Exact versions may vary across platforms; see `environment.yml` for the authoritative specification.
 
 - Python 3.11
 - PyTorch
@@ -58,17 +58,10 @@ Exact versions may vary across platforms; see `environment.yaml` for the authori
 
 ### Download data and checkpoints
 
-Download pretrained weights and place them under:
-
-```
-# checkpoints ~5.5 GB total
-curl -L -o checkpoints.zip https://zenodo.org/records/18480835/files/checkpoints.tar.xz
-tar -xJf checkpoint.tar.xz
-
-# data ~984 MB total
-curl -L -o data.zip https://zenodo.org/records/18480835/files/data.zip # 
-tar -xJf data.tar.xz
-```
+Download the archives from the [ProTok data and checkpoint record](https://zenodo.org/records/18480835)
+and extract the model files into `./checkpoint` and datasets into `./data`.
+Use `tar -xJf` for `.tar.xz` archives and `unzip` for `.zip` archives, matching the
+actual downloaded filenames. The published conda environment is a Linux/CUDA export.
 
 > **Note:** The repo assumes the default checkpoint directory is `./checkpoint`. If you store files elsewhere, pass the corresponding paths in CLI arguments (see each module’s --help).
 
@@ -79,13 +72,35 @@ tar -xJf data.tar.xz
 We provide three main pretrained checkpoints:
 
 - **`ProTok_main.ckpt`**  
-  Latent is **layer-normalized** (recommended for **generation / design** workflows).
+  Latent is **normalized** (recommended for **generation / design** workflows).
 
 - **`ProTok_evo.ckpt`**  
   Latent has **no extra normalization** (recommended for **evolutionary reasoning** tasks).
 
 - **`ProTok_search.ckpt`**  
   CLIP embedding for **sequence search** workflows (**retrieval** with CLIP embeddings + FAISS).
+
+---
+
+## Transfer learning
+
+Fine-tune ProTok on a CSV containing protein sequences and a numeric target, with
+optional class labels for conditional diffusion. Column names and data splits are
+configurable; no custom DataModule is required.
+
+```bash
+python -m scripts.transfer_learning \
+  --train_csv_path my_data/train.csv \
+  --val_csv_path my_data/validation.csv \
+  --sequence_column sequence \
+  --target_column activity \
+  --num_gpus 1
+```
+
+See the [transfer learning guide](docs/transfer_learning.md) for CSV validation,
+automatic splits, optional target bins, CPU/multi-GPU runs, checkpoint selection,
+export metadata and reproducibility notes. Run `--validate_data_only` to check your
+CSV before training. See [release notes](CHANGELOG.md) for correctness fixes.
 
 ---
 
@@ -223,7 +238,7 @@ python -m scripts.tree_inference \
 Prepare:
 - **Reference marker FASTA** (example: `./example/16S.fasta`)
 - **Query gene-family FASTA** (example: `./example/glxK.fasta`)
-- **Oranism information** (example: `./example/cog-24.org.csv`)
+- **Organism information** (example: `./example/cog-24.org.csv`)
 - Reference marker sequences should be named using:
 
 ```
@@ -255,7 +270,8 @@ ProTok supports sequence design by:
 ```bash
 python -m scripts.encode \
   --input ./example/your_sequence.fasta \
-  --output ./example/uncond_traindit_exp.pkl
+  --output ./results/train_embeddings.npy \
+  --save_uncond_train_pkl ./example/uncond_traindit_exp.pkl
 ```
 
 **Step 2 — train diffusion**
@@ -277,7 +293,7 @@ python -m dit_lightning.train \
 
 ```bash
 torchrun --nproc_per_node=2 -m dit_lightning.infer_ddp \
-  --ckpt_path ./checkpoint/uncond/luciferase_diff.ckpt \ # the best checkpoint in step2
+  --ckpt_path ./checkpoint/uncond/luciferase_diff.ckpt \
   --samples_per_class 100 \
   --samples_per_device 50 \
   --labels 0 \
@@ -305,15 +321,24 @@ torchrun --nproc_per_node=2 -m scripts.seq_gen \
 **Step 1 — transfer learning**
 
 ```bash
-python -m scripts.transfer_learning --num_gpus 2 --train_csv_path ./data/Generation_data/DMS/GFP/GFP-train.csv --test_csv_path ./data/Generation_data/DMS/GFP/GFP-test.csv
-## You can add module in src.common.data for your custom datasets
+python -m scripts.transfer_learning \
+  --num_gpus 2 \
+  --train_csv_path ./data/Generation_data/DMS/GFP/GFP-train.csv \
+  --test_csv_path ./data/Generation_data/DMS/GFP/GFP-test.csv \
+  --monitor val_pearson \
+  --ckpt_path ./results/GFP/checkpoints \
+  --save_embedding_path ./results/GFP/train_embeddings.pkl \
+  --project_name GFP
 ```
 
 **Step 2 — train diffusion**
 
+The export contains the training rows and a saved class mapping. Set `--num_classes`
+to its recorded count (8 for the full GFP example).
+
 ```bash
 python -m dit_lightning.train \
-  --train_pkl ./example/cond_traindit_exp.pkl \
+  --train_pkl ./results/GFP/train_embeddings.pkl \
   --max_epochs 25000 \
   --save_dir ./results/dit_runs/GFP \
   --devices 2 \
@@ -328,7 +353,7 @@ python -m dit_lightning.train \
 
 ```bash
 torchrun --nproc_per_node=2 -m dit_lightning.infer_ddp \
-  --ckpt_path ./checkpoint/DMS/GFP_diff.ckpt \ #the best checkpoint in step2
+  --ckpt_path ./checkpoint/DMS/GFP_diff.ckpt \
   --samples_per_class 100 \
   --samples_per_device 100 \
   --labels 6,7 \
@@ -338,9 +363,13 @@ torchrun --nproc_per_node=2 -m dit_lightning.infer_ddp \
 
 **Step 4 — decode to sequences (fixed length for GFP)**
 
+The example below uses the published transfer checkpoint. To use your newly trained
+model, replace `--checkpoint` with the best checkpoint path printed in Step 1.
+Likewise, replace diffusion checkpoint paths in Step 3 when using a newly trained model.
+
 ```bash
 torchrun --nproc_per_node=2 -m scripts.seq_gen \
-  --checkpoint ./checkpoint/DMS/GFP_transfer.ckpt \ #the best checkpoint in step1
+  --checkpoint ./checkpoint/DMS/GFP_transfer.ckpt \
   --input-pkl ./results/out_cond.pkl \
   --output-pkl ./results/out_cond_seq.pkl \
   --batch-size 2 \
@@ -355,7 +384,7 @@ torchrun --nproc_per_node=2 -m scripts.seq_gen \
 
 ## Notes
 
-- Use **`environment.yaml`** for a fully reproducible software environment.  
+- Use **`environment.yml`** for the published Linux/CUDA environment.
 - For multi-GPU execution, make sure:
   - the CUDA driver/toolkit is correctly installed,
   - `torchrun` is available (PyTorch distributed runtime),

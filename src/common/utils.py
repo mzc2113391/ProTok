@@ -456,6 +456,25 @@ def l2_normalize(x, mask = None):
 
 class DecoderUtils:
     @staticmethod
+    def block_no_repeat_ngram_(logits, inputs, ngram_size):
+        if inputs.shape[1] < ngram_size - 1:
+            return
+        for row, tokens in enumerate(inputs.tolist()):
+            prefix = tuple(tokens[-(ngram_size - 1):]) if ngram_size > 1 else ()
+            banned = [tokens[i + ngram_size - 1] for i in range(len(tokens) - ngram_size + 1)
+                      if tuple(tokens[i:i + ngram_size - 1]) == prefix]
+            if banned:
+                logits[row, banned] = -float('inf')
+
+    @staticmethod
+    def apply_repetition_penalty_(logits, inputs, penalty, bos_id):
+        for row, tokens in enumerate(inputs):
+            ids = tokens.unique()
+            ids = ids[ids != bos_id]
+            scores = logits[row, ids]
+            logits[row, ids] = torch.where(scores < 0, scores * penalty, scores / penalty)
+
+    @staticmethod
     def gnmt_lp(length: int, alpha: float = 0.9):
         return ((5.0 + length) / 6.0) ** alpha
 
