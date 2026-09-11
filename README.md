@@ -326,7 +326,7 @@ Values follow the sorted training-label order (GFP labels 1–8):
   regression loss, computed as `sum(weight * squared_error) / sum(weight)`.
   Reconstruction loss and validation/test metrics are unchanged.
 
-For your own data, specify column names directly; no DataModule changes are needed:
+For your own data, specify the column names:
 
 ```bash
 python -m scripts.transfer_learning \
