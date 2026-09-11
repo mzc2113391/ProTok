@@ -24,6 +24,7 @@ from src.common.loss import reduce_loss
 from src.common.prediction import merge_indexed_arrays
 from src.common.lr_scheduler import get_cosine_scheduler_with_warmup
 from src.common.transfer_data import ProteinDataModule
+from src.common.label_weights import parse_label_weights, weighted_mse_loss
 
 
 def build_parser():
@@ -33,8 +34,12 @@ def build_parser():
     p.add_argument('--test_csv_path', help='Optional held-out test CSV, evaluated after model selection.')
     p.add_argument('--sequence_column', default='seq')
     p.add_argument('--target_column', default='fitness')
-    p.add_argument('--label_column', default='label', help='Optional categorical column for exported embeddings; empty string disables it.')
+    p.add_argument('--label_column', default='label', help='Optional class column for weighting and diffusion export; empty string disables it.')
     p.add_argument('--num_bins', type=int, help='Create this many target quantile bins using training rows only; overrides label_column.')
+    p.add_argument('--sampler_label_weights', type=parse_label_weights, default=(1.0,),
+                   help='Relative sampling weights in class-ID order, comma-separated. A single 1 applies to every class.')
+    p.add_argument('--reg_loss_label_weights', type=parse_label_weights, default=(1.0,),
+                   help='Relative regression-loss weights in class-ID order, comma-separated. A single 1 applies to every class.')
     p.add_argument('--val_fraction', type=float, default=0.15)
     p.add_argument('--dataseed', type=int, default=42)
     p.add_argument('--unknown_residues', choices=['error', 'map-to-x'], default='error')
@@ -133,8 +138,7 @@ class ProTok_FT(L.LightningModule):
     def training_step(self, batch, batch_idx):
         outputs = self.model(batch['input'])
         pred = self.regressor(outputs['quantized'].flatten(1)).flatten()
-        # DDP averages local gradients. A differentiable all_gather is unnecessary for MSE.
-        reg_loss = F.mse_loss(pred.float(), batch['fitness'].float().flatten())
+        reg_loss = weighted_mse_loss(pred, batch['fitness'], batch.get('regression_weight'))
         recon_loss = reduce_loss(outputs['decode_protokens_logits'], batch['input']['label_mask'], batch['input']['label'])
         loss = self.hparams.get('recon_loss_weight', 1.0) * recon_loss + self.hparams.get('reg_loss_weight', 2.0) * reg_loss
         for key, value in {'train_recon_loss': recon_loss, 'train_reg_loss': reg_loss, 'train_loss': loss}.items():
@@ -287,6 +291,7 @@ def main():
         sequence_column=args.sequence_column, target_column=args.target_column, label_column=args.label_column,
         val_fraction=args.val_fraction, seed=args.dataseed, num_bins=args.num_bins,
         unknown_residues=args.unknown_residues, long_sequences=args.long_sequences, strip_characters=args.strip_characters,
+        sampler_label_weights=args.sampler_label_weights, reg_loss_label_weights=args.reg_loss_label_weights,
     )
     dm.setup()
     print(f'Data: train={len(dm.train_ds)}, val={len(dm.val_ds)}, test={len(dm.test_ds) if dm.test_ds is not None else 0}; labels={dm.label_metadata}')

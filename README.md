@@ -12,7 +12,6 @@ This is the official code release for paper **“Compressed protein manifolds fo
 - [Overview](#overview)
 - [Installation](#installation)
 - [Pretrained checkpoints](#pretrained-checkpoints)
-- [Transfer learning](#transfer-learning)
 - [Sequence encoding](#sequence-encoding)
 - [Large-scale sequence search (FAISS)](#large-scale-sequence-search-faiss)
 - [Tree inference & phylogenetic congruence](#tree-inference--phylogenetic-congruence)
@@ -79,28 +78,6 @@ We provide three main pretrained checkpoints:
 
 - **`ProTok_search.ckpt`**  
   CLIP embedding for **sequence search** workflows (**retrieval** with CLIP embeddings + FAISS).
-
----
-
-## Transfer learning
-
-Fine-tune ProTok on a CSV containing protein sequences and a numeric target, with
-optional class labels for conditional diffusion. Column names and data splits are
-configurable; no custom DataModule is required.
-
-```bash
-python -m scripts.transfer_learning \
-  --train_csv_path my_data/train.csv \
-  --val_csv_path my_data/validation.csv \
-  --sequence_column sequence \
-  --target_column activity \
-  --num_gpus 1
-```
-
-See the [transfer learning guide](docs/transfer_learning.md) for CSV validation,
-automatic splits, optional target bins, CPU/multi-GPU runs, checkpoint selection,
-export metadata and reproducibility notes. Run `--validate_data_only` to check your
-CSV before training. See [release notes](CHANGELOG.md) for correctness fixes.
 
 ---
 
@@ -320,16 +297,53 @@ torchrun --nproc_per_node=2 -m scripts.seq_gen \
 
 **Step 1 — transfer learning**
 
+Fine-tune ProTok with a CSV containing protein sequences, numeric fitness values,
+and optional class labels. The GFP files use `seq`, `fitness`, and `label` columns:
+
 ```bash
+SAMPLER_LABEL_WEIGHTS="1,1,1,1,1,1,1,1"
+REG_LOSS_LABEL_WEIGHTS="1,1,1,1,1,1,1,1"
+
 python -m scripts.transfer_learning \
   --num_gpus 2 \
   --train_csv_path ./data/Generation_data/DMS/GFP/GFP-train.csv \
   --test_csv_path ./data/Generation_data/DMS/GFP/GFP-test.csv \
+  --sampler_label_weights "${SAMPLER_LABEL_WEIGHTS}" \
+  --reg_loss_label_weights "${REG_LOSS_LABEL_WEIGHTS}" \
   --monitor val_pearson \
   --ckpt_path ./results/GFP/checkpoints \
   --save_embedding_path ./results/GFP/train_embeddings.pkl \
   --project_name GFP
 ```
+
+Both weight settings default to **1 for every class** and can be omitted.
+Values follow the sorted training-label order (GFP labels 1–8):
+
+- `SAMPLER_LABEL_WEIGHTS` controls each class's per-example sampling weight.
+  Nonuniform weights enable weighted sampling with replacement; all ones retain
+  ordinary shuffled training.
+- `REG_LOSS_LABEL_WEIGHTS` controls each class's contribution to the training
+  regression loss, computed as `sum(weight * squared_error) / sum(weight)`.
+  Reconstruction loss and validation/test metrics are unchanged.
+
+For your own data, specify column names directly; no DataModule changes are needed:
+
+```bash
+python -m scripts.transfer_learning \
+  --train_csv_path my_data/train.csv \
+  --val_csv_path my_data/validation.csv \
+  --sequence_column sequence \
+  --target_column activity \
+  --label_column class \
+  --num_gpus 1
+```
+
+The class column is optional. Use `--num_bins 8` to create classes from training
+fitness values when needed for conditional diffusion or class weighting.
+Without `--val_csv_path`, 15% of the training CSV is reserved for validation;
+`--val_fraction` and `--dataseed` control the split. `--test_csv_path` is optional.
+Use `--validate_data_only` to check the CSV before training.
+See the [data and training options](docs/transfer_learning.md) for details.
 
 **Step 2 — train diffusion**
 

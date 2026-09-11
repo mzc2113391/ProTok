@@ -1,6 +1,7 @@
 """Run with: python -m unittest discover -s tests -v"""
 import tempfile
 import unittest
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +17,9 @@ from src.common.lr_scheduler import get_cosine_scheduler_with_warmup
 from src.common.prediction import merge_indexed_arrays
 from src.common.transfer_data import ProteinDataModule
 from src.common.utils import DecoderUtils
+from src.common.label_weights import (
+    DistributedWeightedSampler, parse_label_weights, sample_label_weights, weighted_mse_loss,
+)
 
 
 class OptimizerTests(unittest.TestCase):
@@ -140,6 +144,79 @@ class DataTests(unittest.TestCase):
         dm = self.module(unknown_residues='map-to-x', strip_characters='J')
         dm.setup()
         self.assertIn('ACDX', dm.train_ds.data_seqs + dm.val_ds.data_seqs)
+
+    def test_class_weights_apply_only_to_training(self):
+        dm = self.module(sampler_label_weights=(1, 2), reg_loss_label_weights=(3, 1))
+        dm.setup()
+        expected = self.frame.iloc[dm.train_ds.row_indices]['category'].to_numpy()
+        np.testing.assert_allclose(dm.sampling_weights, np.where(expected == 'high', 0.5, 1.0))
+        np.testing.assert_allclose(dm.train_ds.regression_weights, np.where(expected == 'high', 1.0, 1 / 3))
+        self.assertIsInstance(dm.train_dataloader().sampler, DistributedWeightedSampler)
+        self.assertIn('regression_weight', dm.train_ds[0])
+        self.assertNotIn('regression_weight', dm.val_ds[0])
+        exported_indices = torch.cat([batch['index'] for batch in dm.predict_dataloader()])
+        torch.testing.assert_close(exported_indices, torch.arange(len(dm.train_ds)))
+
+    def test_default_class_weights_preserve_shuffling(self):
+        for weights in [(1,), (1, 1)]:
+            dm = self.module(sampler_label_weights=weights, reg_loss_label_weights=weights)
+            dm.setup()
+            self.assertIsNone(dm.sampling_weights)
+            self.assertIsNone(dm.train_ds.regression_weights)
+            self.assertIsInstance(dm.train_dataloader().sampler, torch.utils.data.RandomSampler)
+
+
+class LabelWeightTests(unittest.TestCase):
+    def test_weight_parsing_and_validation(self):
+        self.assertEqual(parse_label_weights('1, 2, 0'), (1.0, 2.0, 0.0))
+        for value in ['', '1,', 'NaN', 'inf', '-1,2', '0,0']:
+            with self.assertRaises(argparse.ArgumentTypeError):
+                parse_label_weights(value)
+        labels = np.array([0, 1, 1])
+        with self.assertRaisesRegex(ValueError, 'expected 2'):
+            sample_label_weights((1, 1, 1), labels, 2, 'weights')
+        with self.assertRaisesRegex(ValueError, 'require'):
+            sample_label_weights((1, 2), None, 0, 'weights')
+        with self.assertRaisesRegex(ValueError, 'observed'):
+            sample_label_weights((0, 1), np.array([0, 0]), 2, 'weights')
+
+    def test_weighted_mse_value_and_gradients(self):
+        pred = torch.tensor([1.0, 3.0], requires_grad=True)
+        loss = weighted_mse_loss(pred, torch.zeros(2), torch.tensor([1.0, 3.0]))
+        self.assertAlmostEqual(loss.item(), 7.0)
+        loss.backward()
+        torch.testing.assert_close(pred.grad, torch.tensor([0.5, 4.5]))
+        self.assertEqual(weighted_mse_loss(pred, torch.zeros(2)).item(), 5.0)
+        self.assertEqual(weighted_mse_loss(pred, torch.zeros(2), torch.ones(2)).item(), 5.0)
+
+    def test_zero_weight_batch_has_zero_finite_gradients(self):
+        pred = torch.tensor([1.0, 3.0], requires_grad=True)
+        loss = weighted_mse_loss(pred, torch.zeros(2), torch.zeros(2))
+        loss.backward()
+        self.assertEqual(loss.item(), 0.0)
+        torch.testing.assert_close(pred.grad, torch.zeros(2))
+
+    def test_weighted_sampler_distribution_and_epoch_seed(self):
+        weights = np.array([1.0] * 2000 + [3.0] * 2000)
+        sampler = DistributedWeightedSampler(range(4000), weights, seed=42)
+        indices = list(sampler)
+        self.assertEqual(len(indices), 4000)
+        self.assertTrue(0.72 < np.mean(np.array(indices) >= 2000) < 0.78)
+        self.assertLess(len(set(indices)), len(indices))
+        self.assertEqual(indices, list(sampler))
+        sampler.set_epoch(1)
+        self.assertNotEqual(indices, list(sampler))
+
+    def test_weighted_sampler_shards_one_shared_stream(self):
+        weights = [1, 2, 0, 3, 1]
+        samplers = [DistributedWeightedSampler(range(5), weights, num_replicas=2, rank=rank, seed=17)
+                    for rank in range(2)]
+        shards = [list(sampler) for sampler in samplers]
+        self.assertEqual([len(shard) for shard in shards], [3, 3])
+        stream = torch.multinomial(torch.tensor(weights, dtype=torch.double), 6, replacement=True,
+                                   generator=torch.Generator().manual_seed(17)).tolist()
+        self.assertEqual([index for pair in zip(*shards) for index in pair], stream)
+        self.assertNotIn(2, stream)
 
 
 class PredictionTests(unittest.TestCase):

@@ -11,18 +11,20 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset
 
 from .utils import feature_generate, restype_order
+from .label_weights import DistributedWeightedSampler, sample_label_weights
 
 
 class ProteinCSVDataset(Dataset):
     """Validated sequences and scalar targets, with source CSV row indices."""
 
-    def __init__(self, frame, num_prefix_tokens=64, max_len=1024):
+    def __init__(self, frame, num_prefix_tokens=64, max_len=1024, regression_weights=None):
         self.frame = frame.reset_index(drop=True)
         self.num_prefix = num_prefix_tokens
         self.max_len = max_len
         self.data_seqs = self.frame["sequence"].tolist()
         self.data_targets = torch.tensor(self.frame["target"].to_numpy(), dtype=torch.float32)
         self.row_indices = self.frame["row_index"].to_numpy(dtype=np.int64)
+        self.regression_weights = regression_weights
 
     def __len__(self):
         return len(self.frame)
@@ -39,7 +41,10 @@ class ProteinCSVDataset(Dataset):
             max_len=self.max_len,
             mask=False,
         )
-        return {"input": features, "fitness": self.data_targets[index], "index": index}
+        item = {"input": features, "fitness": self.data_targets[index], "index": index}
+        if self.regression_weights is not None:
+            item["regression_weight"] = np.float32(self.regression_weights[index])
+        return item
 
 
 class ProteinDataModule(L.LightningDataModule):
@@ -50,13 +55,14 @@ class ProteinDataModule(L.LightningDataModule):
         max_len=1024, num_workers=4, val_csv_path=None, sequence_column="seq",
         target_column="fitness", label_column="label", val_fraction=0.15,
         seed=42, num_bins=None, unknown_residues="error", long_sequences="error",
-        strip_characters="",
+        strip_characters="", sampler_label_weights=(1.0,), reg_loss_label_weights=(1.0,),
     ):
         super().__init__()
         self.save_hyperparameters()
         self.train_ds = self.val_ds = self.test_ds = self.predict_ds = None
         self.export_labels = None
         self.label_metadata = {}
+        self.sampling_weights = None
         if batch_size < 1 or num_workers < 0:
             raise ValueError("batch_size must be positive and num_workers nonnegative.")
         if not 0 < val_fraction < 1:
@@ -168,6 +174,14 @@ class ProteinDataModule(L.LightningDataModule):
             self._check_overlap(train, val, "Training/validation")
             self._fit_labels(train)
             self.train_ds, self.val_ds = self._dataset(train), self._dataset(val)
+            self.sampling_weights = sample_label_weights(
+                self.hparams.sampler_label_weights, self.export_labels,
+                self.label_metadata["num_classes"], "sampler_label_weights",
+            )
+            self.train_ds.regression_weights = sample_label_weights(
+                self.hparams.reg_loss_label_weights, self.export_labels,
+                self.label_metadata["num_classes"], "reg_loss_label_weights",
+            )
             self.predict_ds = self.train_ds
             if self.hparams.test_csv_path:
                 test = self._read(self.hparams.test_csv_path)
@@ -189,14 +203,22 @@ class ProteinDataModule(L.LightningDataModule):
             "labels": self.label_metadata,
         }
 
-    def _loader(self, dataset, shuffle=False):
+    def _loader(self, dataset, shuffle=False, sampler=None):
         if dataset is None:
             raise ValueError("Requested split is not configured.")
-        return DataLoader(dataset, batch_size=self.hparams.batch_size, shuffle=shuffle,
+        return DataLoader(dataset, batch_size=self.hparams.batch_size, shuffle=shuffle, sampler=sampler,
                           num_workers=self.hparams.num_workers, pin_memory=torch.cuda.is_available(),
                           persistent_workers=self.hparams.num_workers > 0)
 
     def train_dataloader(self):
+        if self.sampling_weights is not None:
+            trainer = self.trainer
+            sampler = DistributedWeightedSampler(
+                self.train_ds, self.sampling_weights,
+                num_replicas=trainer.world_size if trainer is not None else 1,
+                rank=trainer.global_rank if trainer is not None else 0, seed=self.hparams.seed,
+            )
+            return self._loader(self.train_ds, sampler=sampler)
         return self._loader(self.train_ds, shuffle=True)
 
     def val_dataloader(self):
