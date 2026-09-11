@@ -28,6 +28,8 @@ def main():
     parser.add_argument("--output", type=str, default="./example/embeddings.npy", help="Output .npy path")
     parser.add_argument("--type", type=str, choices=["latent", "clip"], default="latent")
     parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--max_len", type=int, default=None,
+                        help="Total padded input length, including prefix and special tokens; inferred from the input if omitted.")
     parser.add_argument("--save_uncond_train_pkl", type=str, default=None)
     args = parser.parse_args()
 
@@ -51,13 +53,17 @@ def main():
     names, seqs = read_fasta(args.input)
     if not seqs or len(names) != len(seqs):
         raise ValueError('Input FASTA must contain one nonempty sequence per header.')
+    num_prefix = model.config.encoder.num_prefix_tokens
+    required_length = max(map(len, seqs)) + num_prefix + 2
+    if args.max_len is not None and args.max_len < required_length:
+        raise ValueError(f'Input requires max_len >= {required_length}; increase --max_len or omit it.')
     
 
     features_dict = build_feature(
         seqs,
         restype_order=restype_order,
-        num_prefix=64,
-        max_len=1024,
+        num_prefix=num_prefix,
+        max_len=args.max_len,
         mask=False,
         return_torch=True,
         torch_device="cpu",
@@ -123,7 +129,8 @@ def main():
         if args.save_uncond_train_pkl and args.type == "latent":
             Path(args.save_uncond_train_pkl).parent.mkdir(parents=True, exist_ok=True)
             with open(args.save_uncond_train_pkl, "wb") as f:
-                pkl.dump({"embedding": results.reshape(-1, 64, 12), "labels": np.zeros(len(results))}, f)
+                pkl.dump({"embedding": results.reshape(-1, num_prefix, model.config.vq_config.latent_dim),
+                          "labels": np.zeros(len(results))}, f)
                 print(f"Saved unconditional training dataset to: {args.save_uncond_train_pkl}")
 
     if world_size > 1:

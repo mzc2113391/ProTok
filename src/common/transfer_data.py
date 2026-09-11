@@ -67,8 +67,8 @@ class ProteinDataModule(L.LightningDataModule):
             raise ValueError("batch_size must be positive and num_workers nonnegative.")
         if not 0 < val_fraction < 1:
             raise ValueError("val_fraction must be between 0 and 1.")
-        if not num_prefix + 2 < max_len <= 1024:
-            raise ValueError("max_len must be > num_prefix + 2 and <= 1024 (including special tokens).")
+        if max_len <= num_prefix + 2:
+            raise ValueError("max_len must be > num_prefix + 2 (including special tokens).")
         if num_bins is not None and num_bins < 2:
             raise ValueError("num_bins must be at least 2.")
 
@@ -104,7 +104,7 @@ class ProteinDataModule(L.LightningDataModule):
             if len(sequence) > limit:
                 if h.long_sequences == "error":
                     raise ValueError(f"{path}: sequence at CSV line {row} has {len(sequence)} residues; "
-                                     f"maximum is {limit}. Use --long_sequences truncate explicitly to crop.")
+                                     f"maximum for the configured max_len is {limit}. Increase --max_len to retain the full sequence.")
                 sequence = sequence[:limit]
             sequences.append(sequence)
         targets = pd.to_numeric(raw[h.target_column], errors="coerce").to_numpy(dtype=np.float32)

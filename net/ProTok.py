@@ -101,15 +101,15 @@ class ProTok(nn.Module):
         B = latent_act.shape[0]
         num_prefix = self.num_prefix_tokens if num_prefix is None else num_prefix
         if max_len is None:
-            max_len = 1024 - num_prefix - 1
+            max_len = 1024
         if latent_act.ndim != 3 or latent_act.shape[1] != num_prefix or num_prefix != self.num_prefix_tokens:
             raise ValueError("Latent prefix dimension must match the checkpoint.")
         if method not in ("beam_search", "greedy_search", "sample", "top_p", "top_k"):
             raise ValueError(f"Unknown decoding method: {method}")
         if num_beams < 1 or num_return_sequences < 1:
             raise ValueError("num_beams and num_return_sequences must be positive.")
-        if not 0 <= min_len <= max_len <= 1024 - num_prefix - 1 or max_len < 1:
-            raise ValueError("Require 0 <= min_len <= max_len <= 1024 - num_prefix - 1 and max_len > 0.")
+        if not 0 <= min_len <= max_len or max_len < 1:
+            raise ValueError("Require 0 <= min_len <= max_len and max_len > 0.")
         bos_id, eos_id = 22, 23
         
 
@@ -138,8 +138,6 @@ class ProTok(nn.Module):
             forbidden_tokens = forbidden_token_ids.to(device=device, dtype=torch.long)
         else:
             forbidden_tokens = torch.tensor(list(forbidden_token_ids), device=device, dtype=torch.long)
-
-        max_len = min(max_len, 1024 - num_prefix - 1)
 
         # ========================= [Greedy Search] =========================
         if method == "greedy_search":

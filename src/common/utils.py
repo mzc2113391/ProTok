@@ -128,7 +128,7 @@ def read_msa(msas):
     return input_msa, input_dlm
 
 
-def create_feature_list(seq_list, num_prefix=64, device="cpu"):
+def create_feature_list(seq_list, num_prefix=64, device="cpu", max_len=None):
     """
     Args:
         seq_list: sequene list
@@ -151,7 +151,7 @@ def create_feature_list(seq_list, num_prefix=64, device="cpu"):
             "residue_index": np.arange(1, seq_len + 1)
         }
         
-        data_dict = feature_generate(raw_features, num_prefix_tokens=num_prefix, max_len=1024)
+        data_dict = feature_generate(raw_features, num_prefix_tokens=num_prefix, max_len=max_len)
         
         tensor_dict = {
             k: torch.as_tensor(v[None, :], dtype=torch.long, device=device) 
@@ -163,14 +163,14 @@ def create_feature_list(seq_list, num_prefix=64, device="cpu"):
     return save_list
 
 
-def feature_generate(feature, num_prefix_tokens=16, max_len=1024,mask=False):
+def feature_generate(feature, num_prefix_tokens=16, max_len=None,mask=False):
     """
     Process protein features for model input/output.
     
     Args:
         feature: Dictionary containing protein features
         num_prefix_tokens: Number of prefix tokens to reserve
-        max_len: Maximum sequence length
+        max_len: Total padded token length; inferred without cropping when omitted
     
     Returns:
         Dictionary with processed data for both structure and sequence
@@ -183,6 +183,10 @@ def feature_generate(feature, num_prefix_tokens=16, max_len=1024,mask=False):
     BOS_TOKEN = { "aatype": 22}
     
     seq_len = feature["seq_len"]
+    if max_len is None:
+        max_len = max(1024, seq_len + num_prefix_tokens + 2)
+    if max_len <= num_prefix_tokens + 2:
+        raise ValueError("max_len must leave room for residues, prefix tokens and BOS/EOS.")
     
     # Determine sequence handling approach based on length
     if seq_len + num_prefix_tokens + 2 > max_len:
@@ -344,7 +348,7 @@ def build_feature(
     seq_list,
     restype_order: dict,
     num_prefix: int = 64,
-    max_len: int = 1024,
+    max_len: Optional[int] = None,
     mask: bool = False,
     ref_seq_list=None,
     return_torch: bool = True,
@@ -354,6 +358,10 @@ def build_feature(
     BOS = 22
 
     n = len(seq_list)
+    if max_len is None:
+        max_len = max(1024, max((len(seq) for seq in seq_list), default=0) + num_prefix + 2)
+    if max_len <= num_prefix + 2:
+        raise ValueError("max_len must leave room for residues, prefix tokens and BOS/EOS.")
     enc_len = max_len - num_prefix
     max_seq_payload = max_len - num_prefix - 2  
 

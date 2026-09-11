@@ -24,8 +24,6 @@ not automatically normalized.
 Sequences are trimmed and uppercased. Standard amino acids and `X` are accepted;
 `--unknown_residues map-to-x` maps ambiguous letters to `X`. Internal whitespace and
 punctuation are rejected. `--strip_characters` explicitly removes specified characters.
-`--max_len` includes prefix and special tokens: the default 1024 allows 958 amino
-acids with the published checkpoint. Use `--long_sequences truncate` to permit cropping.
 
 ## Class weights
 
