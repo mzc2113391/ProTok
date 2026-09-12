@@ -1,6 +1,6 @@
 # ProTok
 
-This is the official code release for paper **“Compressed protein manifolds for evolutionary reasoning and protein engineering.”**
+This is the official code release for paper **“ProTok: compressing protein sequence space for evolutionary inference and protein engineering”**.
 
 <p align="center">
   <a href="figs/git_cover.pdf">
